@@ -39,6 +39,7 @@ const (
 	TUNSIFMODE             = 0x8004745E // sys/net/if_tun.h
 	TUNGIFNAME             = 0x4020745D // sys/net/if_tun.h
 	TUNSIFPID              = 0x2000745F // sys/net/if_tun.h
+	TUNSTRANSIENT          = 0x80627404 // sys/net/if_tun.h, _IOW('t', 98, int), FreeBSD 15+
 	SIOCGIFINFO_IN6        = 0xC048696C // sys/netinet6/in6_var.h
 	SIOCSIFINFO_IN6        = 0xC048696D // sys/netinet6/in6_var.h
 	SIOCAIFADDR_IN6        = 0x8088691B // sys/netinet6/in6_var.h
@@ -81,6 +82,10 @@ func New(options Options) (Tun, error) {
 		if err != nil {
 			return nil, E.Errors(err, tunFile.Close(), destroyTun("tun"))
 		}
+		// FreeBSD 15+: destroy the device automatically when the last
+		// descriptor is closed, so it cannot outlive a killed process.
+		// Unavailable on older versions, ignore the error there.
+		_ = setTransient(tunFile)
 
 		err = E.Errors(
 			setIfHeadMode(tunFile),
@@ -139,10 +144,12 @@ func (t *NativeTun) Start() error {
 
 func (t *NativeTun) Close() error {
 	err := t.unsetRoutes()
-	// The kernel destroys the device when the controlling process closes
-	// it (TUNSIFPID); an explicit destroy is a best-effort fallback.
+	closeErr := t.tunFile.Close()
+	// On FreeBSD 15+ with TUNSTRANSIENT the device is already destroyed by
+	// the close; on older versions the explicit destroy is what removes it.
+	// Errors are ignored since the device may already be gone.
 	_ = destroyTun(t.options.Name)
-	return E.Errors(err, t.tunFile.Close())
+	return E.Errors(err, closeErr)
 }
 
 func (t *NativeTun) Read(p []byte) (n int, err error) {
@@ -380,7 +387,31 @@ func setMTU(name string, mtu int32) error {
 	return nil
 }
 
+// setTransient marks the device to be destroyed automatically when the
+// last descriptor is closed (FreeBSD 15+). Without it, a killed process
+// leaves the device behind.
+func setTransient(tunFile *os.File) error {
+	var errno syscall.Errno
+	transient := 1
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_IOCTL,
+			fd,
+			uintptr(TUNSTRANSIENT),
+			uintptr(unsafe.Pointer(&transient)),
+		)
+	})
+	if errno != 0 {
+		return os.NewSyscallError("TUNSTRANSIENT", errno)
+	}
+	return err
+}
+
 func setTunName(name string, assignedName string) error {
+	if assignedName == name {
+		// The clone device was assigned the requested name already.
+		return nil
+	}
 	return useSocket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
 		var newName [unix.IFNAMSIZ]byte
 		copy(newName[:], name)
